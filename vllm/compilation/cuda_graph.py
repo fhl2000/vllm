@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import enum
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
@@ -20,6 +21,28 @@ from vllm.utils import weak_ref_tensors
 logger = init_logger(__name__)
 
 
+class GlobalCUDAGraphlogger:
+    """A global logger shared by all cudagraph wrappers.
+    so any cudagraph wrapper can log capturing messages but
+    only one message will be logged for the same cudagraph
+    capturing event.
+    """
+
+    def __init__(self, logger):
+        self.logger = logger
+        self.captured_log: set[tuple[CUDAGraphMode, BatchDescriptor]] = set()
+
+    def debug_capture(self, runtime_mode: CUDAGraphMode,
+                      batch_descriptor: BatchDescriptor):
+        if (runtime_mode, batch_descriptor) not in self.captured_log:
+            self.logger.debug("Capturing a cudagraph on (%s,%s)",
+                              runtime_mode.name, batch_descriptor)
+            self.captured_log.add((runtime_mode, batch_descriptor))
+
+
+global_cudagraph_logger = GlobalCUDAGraphlogger(logger)
+
+
 @dataclasses.dataclass
 class CUDAGraphEntry:
     batch_descriptor: BatchDescriptor
@@ -33,9 +56,26 @@ class CUDAGraphEntry:
 
 @dataclasses.dataclass
 class CUDAGraphOptions:
-    debug_log_enable: bool = True
     gc_disable: bool = False
     weak_ref_output: bool = True
+
+
+class CudagraphNodeType(enum.Enum):
+    """ 
+    Used to define if a CUDAGraphWrapper instant is activated for several
+    runtime cudagraph modes. 
+    """
+    NONE = CUDAGraphMode.NONE
+    PIECEWISE = CUDAGraphMode.PIECEWISE
+    FULL = CUDAGraphMode.FULL
+    STREAM_FULL = CUDAGraphMode.FULL
+    STREAM_PIECEWISE = (CUDAGraphMode.FULL, CUDAGraphMode.PIECEWISE)
+
+    def match(self, cudagraph_runtime_mode: CUDAGraphMode) -> bool:
+        """Check if the cudagraph mode matches the node type."""
+        if isinstance(self.value, tuple):
+            return cudagraph_runtime_mode in self.value
+        return cudagraph_runtime_mode == self.value
 
 
 class CUDAGraphWrapper:
@@ -66,21 +106,29 @@ class CUDAGraphWrapper:
     def __init__(self,
                  runnable: Callable,
                  vllm_config: VllmConfig,
-                 runtime_mode: CUDAGraphMode,
+                 node_type: CudagraphNodeType,
                  graph_pool: Any = None,
                  cudagraph_options: Optional[CUDAGraphOptions] = None):
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.graph_pool = graph_pool
-        self.runtime_mode = runtime_mode
+        self.node_type = node_type
         self.compilation_config = vllm_config.compilation_config
 
         self.first_run_finished = False
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
 
-        # assert runtime_mode is not NONE(no cudagraph), otherwise, we don't
+        # assert node type is not NONE(no cudagraph), otherwise, we don't
         # need to initialize a CUDAGraphWrapper.
-        assert self.runtime_mode != CUDAGraphMode.NONE
+        assert self.node_type != CudagraphNodeType.NONE
+        if self.compilation_config.enable_stream_full_cudagraph:
+            assert self.node_type in [
+                CudagraphNodeType.STREAM_FULL,
+                CudagraphNodeType.STREAM_PIECEWISE
+            ], ("Streaming full_cudagraph launching feature is only compatible"
+                " with STREAM_FULL or STREAM_PIECEWISE node type. Current node"
+                f" type is {self.node_type}.")
+
         if self.graph_pool is None:
             self.graph_pool = current_platform.get_global_graph_pool()
 
@@ -108,8 +156,7 @@ class CUDAGraphWrapper:
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
-        if cudagraph_runtime_mode == CUDAGraphMode.NONE or \
-                            cudagraph_runtime_mode != self.runtime_mode:
+        if not self.node_type.match(cudagraph_runtime_mode):
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
             # running without cudagraphs.
             # We do not trigger capture/replay if the runtime mode is not
@@ -117,6 +164,13 @@ class CUDAGraphWrapper:
             # CUDAGraphWrapper when nesting multiple instances with different
             # runtime modes.
             return self.runnable(*args, **kwargs)
+
+        if self.node_type in [
+                CudagraphNodeType.PIECEWISE, CudagraphNodeType.STREAM_PIECEWISE
+        ]:
+            # force the batch descriptor to be non-uniform version for piecewise
+            # cudagraph node type.
+            batch_descriptor = batch_descriptor.non_uniform
 
         if batch_descriptor not in self.concrete_cudagraph_entries:
             # create a new entry for this batch descriptor
@@ -126,13 +180,8 @@ class CUDAGraphWrapper:
         entry = self.concrete_cudagraph_entries[batch_descriptor]
 
         if entry.cudagraph is None:
-            if self.cudagraph_options.debug_log_enable:
-                # Since we capture cudagraph for many different shapes and
-                # capturing is fast, we don't need to log it for every
-                # shape. E.g. we only log it for the first subgraph in
-                # piecewise mode.
-                logger.debug("Capturing a cudagraph on (%s,%s)",
-                             self.runtime_mode.name, entry.batch_descriptor)
+            global_cudagraph_logger.debug_capture(cudagraph_runtime_mode,
+                                                  entry.batch_descriptor)
             # validate that cudagraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 

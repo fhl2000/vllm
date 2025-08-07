@@ -4381,6 +4381,18 @@ class CompilationConfig:
     Warning: This flag is deprecated and will be removed in future releases.
     Please use cudagraph_mode instead.
     """
+    enable_stream_full_cudagraph: bool = False
+    """
+    Experimental feature to enable streaming full cudagraphs launching. It is
+    only valid when piecewise compilation is enabled and cudagraph mode is
+    full cudagraph related(i.e., FULL, FULL_DECODE_ONLY, FULL_AND_PIECEWISE).
+
+    When enabled, it will launch the full cudagraphs in a streaming piecewise
+    fashion, which means that a commonly full cudagraphs does not need to wait
+    to actually launch all kernels until the end of graph.replay calls. Instead,
+    we split full cudagraph into piece, and sequentialy launch each piece to 
+    overlap the cpu overhead of full cudagraph launching.
+    """
     pass_config: PassConfig = field(default_factory=PassConfig)
     """Custom inductor passes, see PassConfig for more details"""
 
@@ -5045,6 +5057,15 @@ class VllmConfig:
                     "Compilation level should be CompilationLevel.PIECEWISE "\
                     "when cudagraph_mode piecewise cudagraphs is used, "\
                     f"cudagraph_mode={self.compilation_config.cudagraph_mode}"
+
+            if self.compilation_config.enable_stream_full_cudagraph:
+                assert self.compilation_config.level == \
+                    CompilationLevel.PIECEWISE and self.compilation_config.\
+                    cudagraph_mode not in [
+                        CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE], (
+                    "Streaming full_cudagraph launching feature is only allowed"
+                    " when piecewise compilation is enabled and cudagraph_mode"
+                    " is full cudagraph related.")
 
         if not self.instance_id:
             self.instance_id = random_uuid()[:5]

@@ -18,7 +18,7 @@ from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.layer import Attention
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.compilation.cuda_graph import CudagraphNodeType, CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (CompilationLevel, CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, update_config)
@@ -2008,12 +2008,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # CudagraphWraper and CudagraphDispatcher of vllm.
 
         # wrap the model with full cudagraph wrapper if needed.
-        if self.compilation_config.cudagraph_mode not in [
+        if not self.compilation_config.enable_stream_full_cudagraph and \
+            self.compilation_config.cudagraph_mode not in [
                 CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE
         ]:
             self.model = CUDAGraphWrapper(self.model,
                                           self.vllm_config,
-                                          runtime_mode=CUDAGraphMode.FULL)
+                                          node_type=CudagraphNodeType.FULL)
 
     def reload_weights(self) -> None:
         assert getattr(self, "model", None) is not None, \

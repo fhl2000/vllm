@@ -293,11 +293,13 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
     """
 
     def __init__(self, module: torch.fx.GraphModule,
+                 global_submod_names: list[str],
                  compile_submod_names: list[str], vllm_config: VllmConfig,
                  graph_pool, vllm_backend: "VllmBackend"):
         super().__init__(module)
         from torch._guards import detect_fake_mode
         self.fake_mode = detect_fake_mode()
+        self.global_submod_names = global_submod_names
         self.compile_submod_names = compile_submod_names
         self.compilation_config = vllm_config.compilation_config
         self.graph_pool = graph_pool
@@ -320,6 +322,10 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         assert isinstance(target, str)
         output = super().call_module(target, args, kwargs)
 
+        # Lazy import here to avoid circular import
+        from .cuda_graph import CudagraphNodeType, CUDAGraphOptions
+        from .cuda_piecewise_backend import PiecewiseBackend
+
         if target in self.compile_submod_names:
             index = self.compile_submod_names.index(target)
             submod = self.fetch_attr(target)
@@ -336,9 +342,6 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 graph_index=index,
                 num_graphs=len(self.compile_submod_names),
                 runtime_shape=None)
-            # Lazy import here to avoid circular import
-            from .cuda_graph import CUDAGraphOptions
-            from .cuda_piecewise_backend import PiecewiseBackend
 
             piecewise_backend = PiecewiseBackend(
                 submod, self.vllm_config, index,
@@ -351,23 +354,42 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 static_graph_wrapper_class = resolve_obj_by_qualname(
                     current_platform.get_static_graph_wrapper_cls())
 
-                # Always assign PIECEWISE runtime mode to the
+                # Always assign (STREAM_)PIECEWISE node type to the
                 # CUDAGraphWrapper for piecewise_backend, to distinguish
-                # it from the FULL cudagraph runtime mode, no matter it
+                # it from the FULL node type, no matter it
                 # is wrapped on a full or piecewise fx graph.
+                node_type = CudagraphNodeType.STREAM_PIECEWISE \
+                    if self.compilation_config.enable_stream_full_cudagraph \
+                    else CudagraphNodeType.PIECEWISE
                 self.module.__dict__[target] = static_graph_wrapper_class(
                     runnable=piecewise_backend,
                     vllm_config=self.vllm_config,
-                    runtime_mode=CUDAGraphMode.PIECEWISE,
+                    node_type=node_type,
                     graph_pool=self.graph_pool,
                     cudagraph_options=CUDAGraphOptions(
-                        debug_log_enable=piecewise_backend.is_first_graph,
                         gc_disable=not piecewise_backend.is_first_graph,
                         weak_ref_output=piecewise_backend.is_last_graph))
             else:
                 self.module.__dict__[target] = piecewise_backend
 
             compilation_counter.num_piecewise_capturable_graphs_seen += 1
+
+        else:
+            # for targets not in compile_submod_names, maybe add streaming
+            # full cudagraph launching feature.
+            if self.compilation_config.enable_stream_full_cudagraph:
+                submod = self.fetch_attr(target)
+                index = self.global_submod_names.index(target)
+                is_last_graph = index == len(self.global_submod_names) - 1
+                self.module.__dict__[target] = static_graph_wrapper_class(
+                    runnable=submod,
+                    vllm_config=self.vllm_config,
+                    node_type=CudagraphNodeType.STREAM_FULL,
+                    graph_pool=self.graph_pool,
+                    cudagraph_options=CUDAGraphOptions(
+                        gc_disable=True, weak_ref_output=is_last_graph))
+
+                compilation_counter.num_piecewise_capturable_graphs_seen += 1
 
         return output
 
@@ -582,12 +604,16 @@ class VllmBackend:
             item.submod_name for item in self.piecewise_graphs
             if not item.is_splitting_graph
         ]
+        submod_names_global = [
+            item.submod_name for item in self.piecewise_graphs
+            if item.is_splitting_graph
+        ]
 
         # propagate the split graph to the piecewise backend,
         # compile submodules with symbolic shapes
-        PiecewiseCompileInterpreter(self.split_gm, submod_names_to_compile,
-                                    self.vllm_config, self.graph_pool,
-                                    self).run(*example_inputs)
+        PiecewiseCompileInterpreter(self.split_gm, submod_names_global,
+                                    submod_names_to_compile, self.vllm_config,
+                                    self.graph_pool, self).run(*example_inputs)
 
         graph_path = os.path.join(local_cache_dir, "computation_graph.py")
         if not os.path.exists(graph_path):
